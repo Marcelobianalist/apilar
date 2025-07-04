@@ -11,7 +11,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Funciones (sin cambios) ---
+# --- Funciones (convertir_a_excel y detectar_delimitador sin cambios) ---
 @st.cache_data
 def convertir_a_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
@@ -26,15 +26,21 @@ def detectar_delimitador(sample: str) -> str:
         return max(conteo, key=conteo.get)
     return ','
 
+# ----- FUNCIÓN LEER_ARCHIVO MEJORADA Y ROBUSTA -----
 def leer_archivo(file: UploadedFile) -> pd.DataFrame:
+    """
+    Lee un archivo, detectando inteligentemente si es un CSV, TXT, Excel real,
+    o una tabla HTML disfrazada de Excel (.xls).
+    """
     nombre_archivo = file.name
+    
     if nombre_archivo.endswith(('.csv', '.txt')):
+        # Lógica para CSV/TXT sin cambios
         posibles_codificaciones = ['utf-8-sig', 'utf-8', 'utf-16', 'latin1', 'windows-1252']
         for encoding in posibles_codificaciones:
             try:
                 file.seek(0)
-                try:
-                    return pd.read_csv(file, encoding=encoding, sep=None, engine='python')
+                try: return pd.read_csv(file, encoding=encoding, sep=None, engine='python')
                 except (pd.errors.ParserError, ValueError):
                     file.seek(0)
                     muestra = file.read(2048).decode(encoding)
@@ -43,22 +49,37 @@ def leer_archivo(file: UploadedFile) -> pd.DataFrame:
                     return pd.read_csv(file, encoding=encoding, sep=separador)
             except Exception:
                 continue
-        raise ValueError(f"No se pudo leer el archivo '{nombre_archivo}' con las codificaciones probadas.")
+        raise ValueError(f"No se pudo leer el archivo de texto '{nombre_archivo}' con las codificaciones probadas.")
+
     elif nombre_archivo.endswith(('.xlsx', '.xls')):
-        engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
-        return pd.read_excel(file, engine=engine)
+        try:
+            # Primero, intenta leerlo como un archivo de Excel normal
+            file.seek(0)
+            engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
+            return pd.read_excel(file, engine=engine)
+        except Exception as e:
+            # SI FALLA, comprueba si es el error específico de "HTML disfrazado"
+            if 'Expected BOF record' in str(e):
+                st.warning(f"'{nombre_archivo}' parece ser una tabla HTML. Intentando leerla como tal...")
+                file.seek(0)
+                # pd.read_html devuelve una LISTA de DataFrames. Usualmente solo queremos el primero.
+                dfs = pd.read_html(file, encoding='utf-8')
+                if dfs:
+                    return dfs[0]
+                else:
+                    raise ValueError(f"El archivo '{nombre_archivo}' parecía HTML pero no se encontraron tablas.")
+            else:
+                # Si es otro tipo de error de Excel, lo relanzamos
+                raise e
     else:
         raise ValueError(f"Formato de archivo no soportado: {nombre_archivo}")
 
-# --- Función de Procesamiento con Sanitización ---
-def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.DataFrame], List[str]]:
+# --- El resto del código no necesita cambios, pero lo incluyo para que sea completo ---
+def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str]]:
     dataframes = []
     errores = []
     columnas_base = None
     orden_columnas_base = []
-
-    # Opcional: Desactivamos la sección de diagnóstico para una UI más limpia
-    # st.subheader("🕵️‍♂️ Diagnóstico de Archivos")
 
     for file in files:
         try:
@@ -89,11 +110,10 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
             errores.append(f"❌ Error CRÍTICO al procesar '{file.name}': {e}")
 
     if not dataframes:
-        return None, errores
+        return None, None, errores
 
     df_consolidado = pd.concat(dataframes, ignore_index=True)
 
-    # Optimización de tipos (sin cambios)
     for col in df_consolidado.select_dtypes(include=['object']).columns:
         if df_consolidado[col].nunique() / len(df_consolidado) < 0.5:
             df_consolidado[col] = df_consolidado[col].astype('category')
@@ -101,18 +121,11 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
         if (df_consolidado[col].dropna() % 1 == 0).all():
             df_consolidado[col] = df_consolidado[col].astype('Int64')
 
-    # ----- INICIO DE LA SECCIÓN DE SANITIZACIÓN -----
-    # Para evitar errores de visualización con PyArrow, convertimos todas las columnas
-    # de tipo 'object' o 'category' a 'string'. Esto es solo para la visualización.
-    # La descarga a Excel usará los tipos de datos más precisos.
     df_para_mostrar = df_consolidado.copy()
     for col in df_para_mostrar.select_dtypes(include=['object', 'category']).columns:
         df_para_mostrar[col] = df_para_mostrar[col].astype(str)
-    # ----- FIN DE LA SECCIÓN DE SANITIZACIÓN -----
 
-    # Devolvemos el DataFrame sanitizado para mostrar, y el original para descargar
     return df_consolidado, df_para_mostrar, errores
-
 
 # --- Interfaz de Usuario (UI) ---
 st.title("📄 Consolidador Inteligente de Archivos")
@@ -129,23 +142,19 @@ archivos_cargados = st.file_uploader(
 
 if archivos_cargados:
     with st.spinner("Procesando archivos..."):
-        # Ahora la función devuelve 3 valores
         df_original, df_para_display, lista_errores = procesar_archivos_cargados(archivos_cargados)
 
     st.subheader("📊 Resultados de la Consolidación")
     
     if lista_errores:
-        st.error("Se encontraron problemas durante el proceso:")
-        for err in lista_errores:
-            st.warning(err)
+        with st.expander("⚠️ Se encontraron algunos problemas (haz clic para ver)", expanded=True):
+            for err in lista_errores:
+                st.warning(err)
 
     if df_para_display is not None and not df_para_display.empty:
         st.success(f"✅ ¡Consolidación exitosa! Se unieron {len(df_original['archivo_origen'].unique())} archivos, resultando en {df_original.shape[0]} filas y {df_original.shape[1]} columnas.")
-        
-        # Usamos el DataFrame sanitizado para la visualización
         st.dataframe(df_para_display)
         
-        # Usamos el DataFrame original y con tipos correctos para la descarga
         excel_bytes = convertir_a_excel(df_original)
         
         st.download_button(
@@ -158,4 +167,3 @@ if archivos_cargados:
         st.error("❌ No se pudo consolidar ningún archivo o la tabla resultante está vacía. Revisa los mensajes de error.")
 else:
     st.info("Esperando a que subas los archivos para comenzar...")
-
