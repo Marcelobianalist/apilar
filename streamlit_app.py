@@ -50,39 +50,25 @@ def leer_archivo(file: UploadedFile) -> pd.DataFrame:
     else:
         raise ValueError(f"Formato de archivo no soportado: {nombre_archivo}")
 
-# --- Función de Procesamiento con Diagnósticos ---
+# --- Función de Procesamiento con Sanitización ---
 def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.DataFrame], List[str]]:
     dataframes = []
     errores = []
     columnas_base = None
     orden_columnas_base = []
 
-    st.subheader("🕵️‍♂️ Diagnóstico de Archivos")
-    st.info("Revisando las columnas de cada archivo antes de consolidar...")
+    # Opcional: Desactivamos la sección de diagnóstico para una UI más limpia
+    # st.subheader("🕵️‍♂️ Diagnóstico de Archivos")
 
     for file in files:
         try:
             df = leer_archivo(file)
-
-            # ----- INICIO DE LA SECCIÓN DE DIAGNÓSTICO -----
-            # Mostramos las columnas de CADA archivo en un desplegable
-            with st.expander(f"Análisis de '{file.name}'", expanded=True):
-                if df.empty:
-                    st.warning("El archivo se leyó como vacío. ¿La cabecera y los datos son correctos?")
-                else:
-                    st.write("**Columnas detectadas:**")
-                    # Mostramos las columnas como una lista para una fácil comparación
-                    st.code(sorted(list(df.columns)))
-                    st.write("**Muestra de datos (primeras 2 filas):**")
-                    st.dataframe(df.head(2))
-            # ----- FIN DE LA SECCIÓN DE DIAGNÓSTICO -----
             
             if df.empty:
                 errores.append(f"⚠️ El archivo '{file.name}' se leyó como vacío y fue ignorado.")
                 continue
 
             if columnas_base is None:
-                st.write(f"➡️ Estableciendo columnas base con el primer archivo: **'{file.name}'**")
                 columnas_base = set(df.columns)
                 orden_columnas_base = list(df.columns)
             
@@ -90,10 +76,8 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
                 columnas_faltantes = columnas_base - set(df.columns)
                 columnas_adicionales = set(df.columns) - columnas_base
                 msg = f"'{file.name}' RECHAZADO. Columnas no coinciden. "
-                if columnas_faltantes:
-                    msg += f"Faltan: {list(columnas_faltantes)}. "
-                if columnas_adicionales:
-                    msg += f"Sobran: {list(columnas_adicionales)}."
+                if columnas_faltantes: msg += f"Faltan: {list(columnas_faltantes)}. "
+                if columnas_adicionales: msg += f"Sobran: {list(columnas_adicionales)}."
                 errores.append(msg)
                 continue
 
@@ -117,7 +101,18 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
         if (df_consolidado[col].dropna() % 1 == 0).all():
             df_consolidado[col] = df_consolidado[col].astype('Int64')
 
-    return df_consolidado, errores
+    # ----- INICIO DE LA SECCIÓN DE SANITIZACIÓN -----
+    # Para evitar errores de visualización con PyArrow, convertimos todas las columnas
+    # de tipo 'object' o 'category' a 'string'. Esto es solo para la visualización.
+    # La descarga a Excel usará los tipos de datos más precisos.
+    df_para_mostrar = df_consolidado.copy()
+    for col in df_para_mostrar.select_dtypes(include=['object', 'category']).columns:
+        df_para_mostrar[col] = df_para_mostrar[col].astype(str)
+    # ----- FIN DE LA SECCIÓN DE SANITIZACIÓN -----
+
+    # Devolvemos el DataFrame sanitizado para mostrar, y el original para descargar
+    return df_consolidado, df_para_mostrar, errores
+
 
 # --- Interfaz de Usuario (UI) ---
 st.title("📄 Consolidador Inteligente de Archivos")
@@ -134,7 +129,8 @@ archivos_cargados = st.file_uploader(
 
 if archivos_cargados:
     with st.spinner("Procesando archivos..."):
-        df_final, lista_errores = procesar_archivos_cargados(archivos_cargados)
+        # Ahora la función devuelve 3 valores
+        df_original, df_para_display, lista_errores = procesar_archivos_cargados(archivos_cargados)
 
     st.subheader("📊 Resultados de la Consolidación")
     
@@ -143,20 +139,23 @@ if archivos_cargados:
         for err in lista_errores:
             st.warning(err)
 
-    if df_final is not None:
-        if not df_final.empty:
-            st.success(f"✅ ¡Consolidación exitosa! Se unieron {len(df_final['archivo_origen'].unique())} archivos, resultando en {df_final.shape[0]} filas y {df_final.shape[1]} columnas.")
-            st.dataframe(df_final)
-            excel_bytes = convertir_a_excel(df_final)
-            st.download_button(
-                label="📥 Descargar Excel Consolidado",
-                data=excel_bytes,
-                file_name="consolidado.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.error("❌ La consolidación resultó en una tabla vacía. Revisa los diagnósticos y errores de arriba.")
+    if df_para_display is not None and not df_para_display.empty:
+        st.success(f"✅ ¡Consolidación exitosa! Se unieron {len(df_original['archivo_origen'].unique())} archivos, resultando en {df_original.shape[0]} filas y {df_original.shape[1]} columnas.")
+        
+        # Usamos el DataFrame sanitizado para la visualización
+        st.dataframe(df_para_display)
+        
+        # Usamos el DataFrame original y con tipos correctos para la descarga
+        excel_bytes = convertir_a_excel(df_original)
+        
+        st.download_button(
+            label="📥 Descargar Excel Consolidado",
+            data=excel_bytes,
+            file_name="consolidado.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     else:
-         st.error("❌ No se pudo consolidar ningún archivo. Revisa los mensajes de error para entender por qué fueron rechazados.")
+        st.error("❌ No se pudo consolidar ningún archivo o la tabla resultante está vacía. Revisa los mensajes de error.")
 else:
     st.info("Esperando a que subas los archivos para comenzar...")
+
