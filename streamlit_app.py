@@ -26,50 +26,50 @@ def detectar_delimitador(sample: str) -> str:
         return max(conteo, key=conteo.get)
     return ','
 
-# ----- FUNCIÓN LEER_ARCHIVO MEJORADA Y ROBUSTA -----
+# ----- FUNCIÓN LEER_ARCHIVO CON LECTURA DE ENCABEZADO FORZADA -----
 def leer_archivo(file: UploadedFile) -> pd.DataFrame:
     """
-    Lee un archivo, detectando inteligentemente si es un CSV, TXT, Excel real,
-    o una tabla HTML disfrazada de Excel (.xls).
+    Lee un archivo, forzando el uso de la primera fila como encabezado (header=0)
+    para asegurar la correcta identificación de las columnas.
     """
     nombre_archivo = file.name
     
     if nombre_archivo.endswith(('.csv', '.txt')):
-        # Lógica para CSV/TXT sin cambios
         posibles_codificaciones = ['utf-8-sig', 'utf-8', 'utf-16', 'latin1', 'windows-1252']
         for encoding in posibles_codificaciones:
             try:
                 file.seek(0)
-                try: return pd.read_csv(file, encoding=encoding, sep=None, engine='python')
+                try: 
+                    # Forzamos header=0
+                    return pd.read_csv(file, encoding=encoding, sep=None, engine='python', header=0)
                 except (pd.errors.ParserError, ValueError):
                     file.seek(0)
                     muestra = file.read(2048).decode(encoding)
                     separador = detectar_delimitador(muestra)
                     file.seek(0)
-                    return pd.read_csv(file, encoding=encoding, sep=separador)
+                    # Forzamos header=0
+                    return pd.read_csv(file, encoding=encoding, sep=separador, header=0)
             except Exception:
                 continue
         raise ValueError(f"No se pudo leer el archivo de texto '{nombre_archivo}' con las codificaciones probadas.")
 
     elif nombre_archivo.endswith(('.xlsx', '.xls')):
         try:
-            # Primero, intenta leerlo como un archivo de Excel normal
             file.seek(0)
             engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
-            return pd.read_excel(file, engine=engine)
+            # Forzamos header=0 para asegurar que tome la primera fila como nombres de columna
+            return pd.read_excel(file, engine=engine, header=0)
         except Exception as e:
-            # SI FALLA, comprueba si es el error específico de "HTML disfrazado"
             if 'Expected BOF record' in str(e):
                 st.warning(f"'{nombre_archivo}' parece ser una tabla HTML. Intentando leerla como tal...")
                 file.seek(0)
-                # pd.read_html devuelve una LISTA de DataFrames. Usualmente solo queremos el primero.
-                dfs = pd.read_html(file, encoding='utf-8')
+                # Forzamos header=0 también para las tablas HTML
+                dfs = pd.read_html(file, encoding='utf-8', header=0)
                 if dfs:
                     return dfs[0]
                 else:
                     raise ValueError(f"El archivo '{nombre_archivo}' parecía HTML pero no se encontraron tablas.")
             else:
-                # Si es otro tipo de error de Excel, lo relanzamos
                 raise e
     else:
         raise ValueError(f"Formato de archivo no soportado: {nombre_archivo}")
