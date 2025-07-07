@@ -5,6 +5,7 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 from typing import List, Tuple, Optional
 import unicodedata
 import re
+import numpy as np # Necesario para el reemplazo a NaN
 
 # --- Configuración de la Página ---
 st.set_page_config(page_title="Consolidador de Archivos", page_icon="📄", layout="wide")
@@ -22,8 +23,10 @@ def limpiar_caracteres_ilegales(valor):
 @st.cache_data
 def convertir_a_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
+    # Se aplica una limpieza final por si acaso, aunque el df ya debería venir limpio.
+    df_clean = df.applymap(limpiar_caracteres_ilegales)
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Consolidado')
+        df_clean.to_excel(writer, index=False, sheet_name='Consolidado')
     return output.getvalue()
 
 def detectar_delimitador(sample: str) -> str:
@@ -40,6 +43,8 @@ def normalizar_nombre_columna(col_name: str) -> str:
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
     s = s.replace(' ', '_').replace('-', '_')
     s = re.sub(r'__+', '_', s)
+    # --- SOLUCIÓN 1: Limpieza final de caracteres ilegales en el nombre de la columna ---
+    s = limpiar_caracteres_ilegales(s)
     return s
 
 def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
@@ -50,18 +55,11 @@ def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
         for encoding in posibles_codificaciones:
             try:
                 file.seek(0)
-                # Añadido skip_blank_lines=True para evitar filas vacías desde el origen
                 return pd.read_csv(file, encoding=encoding, sep=None, engine='python', header=0, skip_blank_lines=True)
-            except (pd.errors.ParserError, ValueError, UnicodeDecodeError):
-                try:
-                    file.seek(0)
-                    muestra = file.read(2048).decode(encoding, errors='ignore')
-                    separador = detectar_delimitador(muestra)
-                    file.seek(0)
-                    return pd.read_csv(file, encoding=encoding, sep=separador, header=0, skip_blank_lines=True)
-                except Exception:
-                    continue
-        st.warning(f"No se pudo leer el archivo de texto '{file.name}' con las configuraciones probadas.")
+            except Exception:
+                continue # Intenta con la siguiente codificación/método
+        # Si todo falla
+        st.warning(f"No se pudo leer el archivo de texto '{file.name}' con las configuraciones automáticas.")
         return None
 
     elif nombre_archivo.endswith(('.xlsx', '.xls')):
@@ -72,16 +70,15 @@ def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
         except Exception as e:
             if 'Expected BOF record' in str(e):
                 st.info(f"'{file.name}' parece ser una tabla HTML. Intentando leerla como tal...")
-                file.seek(0)
                 try:
-                    dfs = pd.read_html(file, header=0)
+                    file.seek(0)
+                    dfs = pd.read_html(file, header=0, encoding='utf-8')
                     if dfs: return dfs[0]
                 except Exception:
-                    pass
-                st.warning(f"El archivo '{file.name}' parecía HTML pero no se pudo leer.")
-                return None
+                    st.warning(f"El archivo '{file.name}' parecía HTML pero no se pudo leer.")
+                    return None
             else:
-                raise e
+                raise e # Lanza otras excepciones de Excel
     
     st.warning(f"Formato de archivo no soportado: {file.name}")
     return None
@@ -92,56 +89,46 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
     for file in files:
         try:
             df = leer_archivo(file)
-            
-            if df is None:
-                # El mensaje ya fue emitido por leer_archivo
-                continue
+            if df is None: continue
 
-            # --- NUEVO: Limpieza crucial post-lectura ---
-            # 1. Elimina filas que son completamente nulas. Esto resuelve el problema de las "filas nulas" entre datos.
-            df.dropna(how='all', inplace=True)
+            # --- SOLUCIÓN 2: LIMPIEZA AGRESIVA DE FILAS VACÍAS / CON ESPACIOS ---
+            # Reemplaza celdas que solo contienen espacios en blanco con NaN.
+            df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+            # Reemplaza representaciones de texto comunes de nulos con NaN real.
+            # `na_values` en read_csv podría hacer esto, pero hacerlo aquí es más universal.
+            df.replace(['nan', 'None', 'NULL', 'NA'], np.nan, inplace=True)
             
-            # 2. Resetea el índice si después de borrar filas queda desordenado.
+            # Ahora, con los NaN estandarizados, elimina filas que son completamente nulas.
+            df.dropna(how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
 
             if df.empty:
-                mensajes_log.append(f"ℹ️ El archivo '{file.name}' está vacío o solo contenía filas en blanco. Se ignorará."); continue
+                mensajes_log.append(f"ℹ️ El archivo '{file.name}' resultó estar vacío tras la limpieza y fue ignorado."); continue
 
             df.columns = [normalizar_nombre_columna(col) for col in df.columns]
             df = df.loc[:, ~df.columns.str.match('unnamed')]
 
-            # --- LÓGICA MEJORADA PARA ESTABLECER LAS COLUMNAS BASE ---
             if columnas_base is None:
-                # Heurística: si las columnas son solo números, es probable que Pandas no haya encontrado el encabezado.
-                # Saltamos este archivo y buscamos uno mejor para usar como plantilla.
                 if all(col.isdigit() for col in df.columns):
-                    mensajes_log.append(f"⚠️ El archivo '{file.name}' parece no tener un encabezado válido (columnas numéricas). Se saltará para establecer la estructura base.")
+                    mensajes_log.append(f"⚠️ Se ignoró '{file.name}' para establecer la plantilla porque no parece tener un encabezado válido (columnas numéricas).")
                     continue
                 
-                # Este archivo parece bueno, lo usamos como plantilla
                 columnas_base = set(df.columns)
                 orden_columnas_base = sorted(list(df.columns))
-                mensajes_log.append(f"✅ Estructura de columnas establecida a partir de '{file.name}'.")
-                
-                # Añadimos el primer archivo válido a la lista
-                df['archivo_origen'] = file.name
-                dataframes.append(df)
+                mensajes_log.append(f"✅ Estructura base establecida desde '{file.name}'.")
             
-            else: # Ya tenemos una estructura base, comparamos con ella
-                if set(df.columns) != columnas_base:
-                    faltantes = sorted(list(columnas_base - set(df.columns)))
-                    adicionales = sorted(list(set(df.columns) - columnas_base))
-                    msg = f"❌ '{file.name}' RECHAZADO. Las columnas no coinciden con la plantilla. "
-                    if faltantes: msg += f"Faltan: {faltantes}. "
-                    if adicionales: msg += f"Sobran: {adicionales}."
-                    mensajes_log.append(msg)
-                    continue
-                
-                # Las columnas coinciden, añadimos el dataframe
-                df = df[orden_columnas_base]
-                df['archivo_origen'] = file.name
-                dataframes.append(df)
-                mensajes_log.append(f"✅ '{file.name}' procesado y añadido a la consolidación.")
+            if set(df.columns) != columnas_base:
+                faltantes = sorted(list(columnas_base - set(df.columns)))
+                adicionales = sorted(list(set(df.columns) - columnas_base))
+                msg = f"❌ '{file.name}' RECHAZADO. Las columnas no coinciden. "
+                if faltantes: msg += f"Faltan: {faltantes}. "
+                if adicionales: msg += f"Sobran: {adicionales}."
+                mensajes_log.append(msg); continue
+            
+            df = df[orden_columnas_base]
+            df['archivo_origen'] = file.name
+            dataframes.append(df)
+            mensajes_log.append(f"✅ '{file.name}' procesado correctamente.")
 
         except Exception as e:
             mensajes_log.append(f"💥 Error CRÍTICO al procesar '{file.name}': {e}")
@@ -151,11 +138,9 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
 
     df_consolidado = pd.concat(dataframes, ignore_index=True)
     
-    for col in df_consolidado.select_dtypes(include=['object', 'category']).columns:
-        df_consolidado[col] = df_consolidado[col].astype(str).apply(limpiar_caracteres_ilegales)
-
+    # La limpieza de datos ahora se puede simplificar porque ya se hizo mucho trabajo antes
     for col in df_consolidado.select_dtypes(include=['object']).columns:
-        if df_consolidado[col].nunique() / len(df_consolidado) < 0.5:
+        if df_consolidado[col].nunique() / len(df_consolidado[col].dropna()) < 0.5:
             df_consolidado[col] = df_consolidado[col].astype('category')
     
     for col in df_consolidado.select_dtypes(include=['float']).columns:
@@ -165,8 +150,8 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
     return df_consolidado, mensajes_log
 
 # --- Interfaz de Usuario (UI) ---
-st.title("📄 Consolidador de Archivos (Versión Fortalecida)")
-st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, manejando inteligentemente encabezados y filas vacías.")
+st.title("📄 Consolidador de Archivos (Versión Blindada v3)")
+st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, realizando una limpieza profunda de datos, encabezados y filas vacías.")
 
 archivos_cargados = st.file_uploader(
     "📤 Seleccione sus archivos aquí",
@@ -175,7 +160,7 @@ archivos_cargados = st.file_uploader(
 )
 
 if archivos_cargados:
-    with st.spinner("Procesando, validando y consolidando archivos..."):
+    with st.spinner("Realizando limpieza profunda y consolidación..."):
         df_final, lista_logs = procesar_archivos_cargados(archivos_cargados)
     
     st.subheader("📊 Resultados de la Consolidación")
@@ -191,7 +176,8 @@ if archivos_cargados:
         archivos_ok = df_final['archivo_origen'].nunique()
         st.success(f"✅ ¡Consolidación exitosa! Se unieron {archivos_ok} archivos, resultando en {df_final.shape[0]} filas y {df_final.shape[1]} columnas.")
         
-        st.dataframe(df_final)
+        # Para la visualización, reemplazamos NaN con una cadena vacía para que no se muestre "NaN"
+        st.dataframe(df_final.fillna(''))
         
         try:
             excel_bytes = convertir_a_excel(df_final)
@@ -203,9 +189,7 @@ if archivos_cargados:
             )
         except Exception as e:
             st.error(f"💥 Error al generar el archivo Excel: {e}")
-            st.info("Intente limpiar el caché de la aplicación (Menú ☰ -> Clear cache) y vuelva a cargar los archivos.")
-    elif not lista_logs:
-        st.info("No se han subido archivos válidos para procesar.")
+            st.info("Este error puede ocurrir si quedan caracteres incompatibles. La herramienta intenta eliminarlos, pero algunos pueden persistir. Revise los nombres de columna y los datos en los archivos originales.")
     else:
         st.error("❌ No se pudo consolidar ningún archivo. Por favor, revise los mensajes en el registro de procesamiento.")
 else:
