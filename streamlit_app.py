@@ -36,23 +36,17 @@ def normalizar_nombre_columna(col_name: str) -> str:
     s = limpiar_caracteres_ilegales(s)
     return s
 
-# --- SOLUCIÓN: FUNCIÓN DE LECTURA DE ARCHIVOS MEJORADA Y ROBUSTA ---
 def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
     nombre_archivo = file.name.lower()
     
     if nombre_archivo.endswith(('.csv', '.txt')):
-        # Lista de codificaciones a probar, con utf-16 y utf-8-sig primero por ser comunes en Windows.
         posibles_codificaciones = ['utf-16', 'utf-8-sig', 'utf-8', 'latin1', 'windows-1252']
         for encoding in posibles_codificaciones:
             try:
-                # Es crucial resetear el puntero del archivo en cada intento
                 file.seek(0)
-                # Intentar leer con la codificación actual
                 return pd.read_csv(file, encoding=encoding, sep=None, engine='python', header=0, skip_blank_lines=True)
             except (UnicodeDecodeError, pd.errors.ParserError):
-                # Si falla por codificación o parseo, simplemente continúa con la siguiente
                 continue
-        # Si el bucle termina sin éxito, significa que ninguna codificación funcionó.
         st.warning(f"No se pudo leer el archivo de texto '{file.name}' con ninguna de las codificaciones probadas.")
         return None
 
@@ -75,7 +69,6 @@ def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
                 st.error(f"Error al leer el archivo Excel '{file.name}': {e}")
                 return None
     
-    # Si el formato no es ni texto ni excel
     st.warning(f"Formato de archivo no soportado: {file.name}")
     return None
 
@@ -104,7 +97,10 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
                     mensajes_log.append(f"⚠️ '{file.name}' ignorado para plantilla (encabezado no válido).")
                     continue
                 columnas_base = set(df.columns)
-                orden_columnas_base = sorted(list(df.columns))
+                
+                # --- CAMBIO CLAVE: Se elimina sorted() para respetar el orden original ---
+                orden_columnas_base = list(df.columns)
+                
                 mensajes_log.append(f"✅ Estructura base establecida desde '{file.name}'.")
 
             if set(df.columns) != columnas_base:
@@ -144,7 +140,7 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
     return df_consolidado, mensajes_log
 
 # --- Interfaz de Usuario (UI) ---
-st.title("📄 Consolidador de Archivos (v. Final)")
+st.title("📄 Consolidador de Archivos")
 st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, detectando automáticamente la codificación, eliminando filas en blanco y normalizando los datos.")
 
 archivos_cargados = st.file_uploader(
