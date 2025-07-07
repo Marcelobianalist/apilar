@@ -36,21 +36,49 @@ def normalizar_nombre_columna(col_name: str) -> str:
     s = limpiar_caracteres_ilegales(s)
     return s
 
+# --- SOLUCIÓN: FUNCIÓN DE LECTURA DE ARCHIVOS MEJORADA Y ROBUSTA ---
 def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
     nombre_archivo = file.name.lower()
-    try:
-        if nombre_archivo.endswith(('.csv', '.txt')):
-            file.seek(0)
-            return pd.read_csv(file, sep=None, engine='python', header=0, skip_blank_lines=True, on_bad_lines='warn')
-        elif nombre_archivo.endswith(('.xlsx', '.xls')):
+    
+    if nombre_archivo.endswith(('.csv', '.txt')):
+        # Lista de codificaciones a probar, con utf-16 y utf-8-sig primero por ser comunes en Windows.
+        posibles_codificaciones = ['utf-16', 'utf-8-sig', 'utf-8', 'latin1', 'windows-1252']
+        for encoding in posibles_codificaciones:
+            try:
+                # Es crucial resetear el puntero del archivo en cada intento
+                file.seek(0)
+                # Intentar leer con la codificación actual
+                return pd.read_csv(file, encoding=encoding, sep=None, engine='python', header=0, skip_blank_lines=True)
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                # Si falla por codificación o parseo, simplemente continúa con la siguiente
+                continue
+        # Si el bucle termina sin éxito, significa que ninguna codificación funcionó.
+        st.warning(f"No se pudo leer el archivo de texto '{file.name}' con ninguna de las codificaciones probadas.")
+        return None
+
+    elif nombre_archivo.endswith(('.xlsx', '.xls')):
+        try:
             file.seek(0)
             engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
             return pd.read_excel(file, engine=engine, header=0)
-        else:
-            return None
-    except Exception as e:
-        st.warning(f"No se pudo leer '{file.name}' de forma estándar. Error: {e}")
-        return None
+        except Exception as e:
+            if 'Expected BOF record' in str(e):
+                st.info(f"'{file.name}' parece ser una tabla HTML. Intentando leerla como tal...")
+                try:
+                    file.seek(0)
+                    dfs = pd.read_html(file, header=0, encoding='utf-8')
+                    if dfs: return dfs[0]
+                except Exception:
+                    st.warning(f"El archivo '{file.name}' parecía HTML pero no se pudo leer.")
+                    return None
+            else:
+                st.error(f"Error al leer el archivo Excel '{file.name}': {e}")
+                return None
+    
+    # Si el formato no es ni texto ni excel
+    st.warning(f"Formato de archivo no soportado: {file.name}")
+    return None
+
 
 def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.DataFrame], List[str]]:
     dataframes, mensajes_log, columnas_base, orden_columnas_base = [], [], None, None
@@ -58,12 +86,8 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
     for file in files:
         try:
             df = leer_archivo(file)
-            if df is None:
-                mensajes_log.append(f"⚠️ Formato de '{file.name}' no soportado o archivo corrupto."); continue
+            if df is None: continue
 
-            # --- SOLUCIÓN DEFINITIVA PARA FILAS EN BLANCO ---
-            # Selecciona solo las filas que NO están completamente vacías.
-            # Esto es más robusto que dropna() y resuelve el problema de las filas intercaladas.
             filas_originales = len(df)
             df = df[~df.isnull().all(axis=1)]
             filas_eliminadas = filas_originales - len(df)
@@ -93,7 +117,6 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
 
             df = df[orden_columnas_base]
             for col in df.select_dtypes(include=['object']).columns:
-                # Se convierte a str para asegurar que `apply` no falle, y se limpian caracteres.
                 df[col] = df[col].astype(str).apply(limpiar_caracteres_ilegales)
             
             df['archivo_origen'] = file.name
@@ -121,8 +144,8 @@ def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.D
     return df_consolidado, mensajes_log
 
 # --- Interfaz de Usuario (UI) ---
-st.title("📄 Consolidador de Archivos (Versión Definitiva)")
-st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, eliminando automáticamente filas en blanco y normalizando los datos.")
+st.title("📄 Consolidador de Archivos (v. Final)")
+st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, detectando automáticamente la codificación, eliminando filas en blanco y normalizando los datos.")
 
 archivos_cargados = st.file_uploader(
     "📤 Seleccione sus archivos aquí",
@@ -147,7 +170,6 @@ if archivos_cargados:
         archivos_ok = df_final['archivo_origen'].nunique()
         st.success(f"✅ ¡Consolidación exitosa! Se unieron {archivos_ok} archivos, resultando en {df_final.shape[0]} filas y {df_final.shape[1]} columnas.")
         
-        # Para la visualización, convertimos a objeto para poder rellenar con '' sin errores de tipo.
         st.dataframe(df_final.astype(object).fillna(''))
         
         try:
