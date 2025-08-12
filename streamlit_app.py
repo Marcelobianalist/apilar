@@ -1,193 +1,184 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from typing import List, Optional, Tuple, Union
+from streamlit.runtime.uploaded_file_manager import UploadedFile
+from typing import List, Tuple, Optional
 import unicodedata
 import re
-import chardet # <-- IMPORTANTE: Nueva librería
+import numpy as np
 
-# --- Configuración de la página ---
-st.set_page_config(page_title="Consolidador Universal", page_icon="⚙️", layout="wide")
+# --- Configuración de la Página ---
+st.set_page_config(page_title="Consolidador de Archivos", page_icon="📄", layout="wide")
 
-# --- Constantes ---
-# Lista de respaldo si chardet falla
-FALLBACK_ENCODINGS = ['utf-8', 'latin1', 'windows-1252', 'iso-8859-1']
-COMMON_DELIMITERS = [',', ';', '\t', '|'] 
-ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
-CATEGORY_THRESHOLD = 0.5
-DEFAULT_SHEET_NAME_INPUT = "0"
+# ----- FUNCIÓN DE LIMPIEZA DE CARACTERES -----
+ILLEGAL_CHARACTERS_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
 
-
-# --- Funciones Auxiliares (sin cambios) ---
-def limpiar_caracteres_ilegales(valor: any) -> any:
-    if isinstance(valor, str): return ILLEGAL_CHARACTERS_RE.sub('', valor)
+def limpiar_caracteres_ilegales(valor):
+    if isinstance(valor, str):
+        return ILLEGAL_CHARACTERS_RE.sub('', valor)
     return valor
 
-def normalizar_nombre_columna(col: any) -> str:
-    if not isinstance(col, str): col = str(col)
-    s = limpiar_caracteres_ilegales(col).lower().strip()
-    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-    s = s.replace('°', 'nro').replace('º', 'nro')
-    s = re.sub(r"[ ./\-]+", "_", s)
-    s = re.sub(r'__+', '_', s)
-    s = s.strip('_')
-    return s if s else "columna_sin_nombre"
+# --- Funciones de Utilidad ---
 
-def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame:
-    df_optimizado = df.copy()
-    for col in df_optimizado.select_dtypes(include=['float']).columns:
-        df_optimizado[col] = pd.to_numeric(df_optimizado[col], downcast='integer')
-    for col in df_optimizado.select_dtypes(include=['object']).columns:
-        if col == 'archivo_origen': continue
-        num_unicos = df_optimizado[col].nunique()
-        if len(df_optimizado) > 0 and (num_unicos / len(df_optimizado)) < CATEGORY_THRESHOLD:
-            df_optimizado[col] = df_optimizado[col].astype('category')
-    return df_optimizado
-
-def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
+@st.cache_data
+def convertir_a_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Consolidado')
-    output.seek(0)
-    return output
+    return output.getvalue()
 
-# --- LÓGICA DE LECTURA CON DETECCIÓN DE ENCODING Y SEPARADOR ---
-def leer_archivo(file, sheet_name: Union[str, int, None]) -> Optional[pd.DataFrame]:
-    """
-    Lee un archivo subido de forma robusta, detectando automáticamente la codificación
-    y el separador para archivos de texto.
-    """
+def normalizar_nombre_columna(col_name: str) -> str:
+    if not isinstance(col_name, str): col_name = str(col_name)
+    s = col_name.lower().strip()
+    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    s = s.replace(' ', '_').replace('-', '_').replace('°', 'nro').replace('º', 'nro')
+    s = re.sub(r'__+', '_', s)
+    s = limpiar_caracteres_ilegales(s)
+    return s
+
+def leer_archivo(file: UploadedFile) -> Optional[pd.DataFrame]:
     nombre_archivo = file.name.lower()
     
-    try:
-        # --- Lógica para archivos Excel (sin cambios) ---
-        if nombre_archivo.endswith(('.xlsx', '.xls')):
-            file.seek(0)
-            engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
-            return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
-            
-        # --- Lógica DEFINITIVA para archivos de Texto Plano ---
-        elif nombre_archivo.endswith(('.csv', '.txt', '.tsv')):
-            file.seek(0)
-            # 1. Leer los bytes para detectar la codificación
-            raw_data = file.read()
-            if not raw_data:
-                return pd.DataFrame() # Archivo vacío
-
-            result = chardet.detect(raw_data)
-            encoding_detectado = result['encoding']
-            
-            # Crear una lista de encodings a probar, con el detectado como prioridad
-            encodings_to_try = [encoding_detectado] + FALLBACK_ENCODINGS
-            # Eliminar duplicados manteniendo el orden
-            encodings_to_try = list(dict.fromkeys(filter(None, encodings_to_try)))
-
-            for encoding in encodings_to_try:
-                try:
-                    file.seek(0)
-                    # Intentar leer con auto-detección de separador
-                    df = pd.read_csv(file, sep=None, engine='python', encoding=encoding, on_bad_lines='skip')
-                    
-                    # Si solo tiene una columna, probar delimitadores comunes
-                    if df.shape[1] == 1:
-                        file.seek(0)
-                        first_line = file.readline().decode(encoding)
-                        file.seek(0)
-                        for sep in COMMON_DELIMITERS:
-                            if sep in first_line:
-                                try:
-                                    df_manual = pd.read_csv(file, sep=sep, encoding=encoding, on_bad_lines='skip')
-                                    if df_manual.shape[1] > 1:
-                                        return df_manual
-                                except pd.errors.ParserError:
-                                    file.seek(0)
-                                    continue
-                    return df # Si todo funciona, devolver el DataFrame
-
-                except (UnicodeDecodeError, pd.errors.ParserError):
-                    continue # Probar el siguiente encoding de la lista
-
-            # Si nada funcionó, es un caso muy raro.
-            return None
-            
-    except Exception as e:
-        st.error(f"Error crítico al leer '{file.name}': {e}")
+    if nombre_archivo.endswith(('.csv', '.txt')):
+        posibles_codificaciones = ['utf-16', 'utf-8-sig', 'utf-8', 'latin1', 'windows-1252']
+        for encoding in posibles_codificaciones:
+            try:
+                file.seek(0)
+                return pd.read_csv(file, encoding=encoding, sep=None, engine='python', header=0, skip_blank_lines=True)
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+        st.warning(f"No se pudo leer el archivo de texto '{file.name}' con ninguna de las codificaciones probadas.")
         return None
 
+    elif nombre_archivo.endswith(('.xlsx', '.xls')):
+        try:
+            file.seek(0)
+            engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
+            return pd.read_excel(file, engine=engine, header=0)
+        except Exception as e:
+            if 'Expected BOF record' in str(e):
+                st.info(f"'{file.name}' parece ser una tabla HTML. Intentando leerla como tal...")
+                try:
+                    file.seek(0)
+                    dfs = pd.read_html(file, header=0, encoding='utf-8')
+                    if dfs: return dfs[0]
+                except Exception:
+                    st.warning(f"El archivo '{file.name}' parecía HTML pero no se pudo leer.")
+                    return None
+            else:
+                st.error(f"Error al leer el archivo Excel '{file.name}': {e}")
+                return None
+    
+    st.warning(f"Formato de archivo no soportado: {file.name}")
     return None
 
-# --- El resto del código (procesar_archivos, main) NO NECESITA CAMBIOS ---
 
-def procesar_archivos(files: List, sheet_name: Union[str, int, None]) -> Tuple[Optional[pd.DataFrame], List[str]]:
-    dataframes, logs = [], []
-    sheet_option_used = str(sheet_name) != DEFAULT_SHEET_NAME_INPUT
+def procesar_archivos_cargados(files: List[UploadedFile]) -> Tuple[Optional[pd.DataFrame], List[str]]:
+    dataframes, mensajes_log, columnas_base, orden_columnas_base = [], [], None, None
+
     for file in files:
-        logs.append(f"⏳ Procesando '{file.name}'...")
-        is_excel = file.name.lower().endswith(('.xlsx', '.xls'))
-        if sheet_option_used and not is_excel:
-            logs.append(f"ℹ️  Opción de hoja '{sheet_name}' ignorada para el archivo de texto '{file.name}'.")
-        df = leer_archivo(file, sheet_name)
-        if df is None:
-            logs.append(f"💥 Error: No se pudo leer o decodificar el archivo '{file.name}'.")
-            continue
-        df.dropna(how='all', inplace=True)
-        if df.empty:
-            logs.append(f"⚠️ Aviso: El archivo '{file.name}' está vacío o no contiene datos válidos.")
-            continue
-        df.columns = [normalizar_nombre_columna(c) for c in df.columns]
-        df = df.loc[:, ~df.columns.str.contains('^unnamed', na=False)]
-        df['archivo_origen'] = file.name
-        dataframes.append(df)
-        logs.append(f"✅ Éxito: '{file.name}' añadido a la consolidación.")
-    if not dataframes: return None, logs
-    df_final = pd.concat(dataframes, ignore_index=True, sort=False)
-    cols = df_final.columns.tolist()
-    if 'archivo_origen' in cols:
-        cols.insert(0, cols.pop(cols.index('archivo_origen')))
-        df_final = df_final[cols]
-    return optimizar_tipos_memoria(df_final), logs
+        try:
+            df = leer_archivo(file)
+            if df is None: continue
 
-def main():
-    st.title("⚙️ Consolidador Universal de Archivos")
-    st.markdown("Sube tus archivos (`Excel`, `CSV`, `TXT`, `TSV`). El sistema auto-detectará el formato, **codificación** y **separador** para unirlos.")
-    st.info("Para que esta aplicación funcione, la librería `chardet` debe estar instalada (`pip install chardet`).")
-    with st.expander("Opciones avanzadas"):
-        sheet_input = st.text_input("Nombre u hoja de Excel (solo .xlsx/.xls)", DEFAULT_SHEET_NAME_INPUT, help="Escribe el nombre de la hoja o el número (empezando en 0).")
-        try: sheet_name = int(sheet_input)
-        except ValueError: sheet_name = sheet_input
-    archivos = st.file_uploader("📤 Sube tus archivos aquí", type=['xlsx', 'xls', 'csv', 'txt', 'tsv'], accept_multiple_files=True)
-    if archivos:
-        # El resto de la función main es idéntica
-        with st.spinner("🔄 Procesando y consolidando archivos..."):
-            df_consolidado, logs = procesar_archivos(archivos, sheet_name)
-        st.subheader("📜 Registro de Procesamiento")
-        for log in logs:
-            if "✅" in log: st.success(log)
-            elif "⚠️" in log: st.warning(log)
-            elif "💥" in log: st.error(log)
-            else: st.info(log)
-        st.markdown("---")
-        if df_consolidado is not None and not df_consolidado.empty:
-            st.header("🎉 Consolidación completada")
-            st.success(f"Se han consolidado **{df_consolidado.shape[0]:,}** filas y **{df_consolidado.shape[1]}** columnas.")
-            st.subheader("📊 Previsualización (primeros 500 registros)")
-            st.dataframe(df_consolidado.head(500).astype(str), use_container_width=True)
-            st.subheader("⬇️ Descarga")
-            try:
-                with st.spinner("⏳ Preparando archivo Excel..."):
-                    excel_bytes = crear_excel_en_memoria(df_consolidado)
-                st.success("✅ ¡Archivo Excel listo!")
-                st.download_button("📥 Descargar Excel Consolidado (.xlsx)", excel_bytes, "consolidado.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-            except Exception as e:
-                st.error(f"💥 **Error al generar Excel:** {e}")
-                st.info("**Plan B:** Descargando como CSV, formato más rápido para archivos grandes.")
-                with st.spinner("⏳ Generando archivo CSV de respaldo..."):
-                    csv_bytes = df_consolidado.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("📥 Descargar Datos en CSV (.csv)", csv_bytes, "consolidado.csv", "text/csv", use_container_width=True)
-        else:
-            st.error("❌ No se pudo generar un archivo consolidado. Revisa los registros.")
+            filas_originales = len(df)
+            df = df[~df.isnull().all(axis=1)]
+            filas_eliminadas = filas_originales - len(df)
+            
+            if df.empty:
+                mensajes_log.append(f"ℹ️ El archivo '{file.name}' resultó estar vacío tras la limpieza y fue ignorado."); continue
+
+            df.reset_index(drop=True, inplace=True)
+            df.columns = [normalizar_nombre_columna(col) for col in df.columns]
+            df = df.loc[:, ~df.columns.str.contains('^unnamed')]
+
+            if columnas_base is None:
+                if any(col.isdigit() for col in df.columns):
+                    mensajes_log.append(f"⚠️ '{file.name}' ignorado para plantilla (encabezado no válido).")
+                    continue
+                columnas_base = set(df.columns)
+                
+                # --- CAMBIO CLAVE: Se elimina sorted() para respetar el orden original ---
+                orden_columnas_base = list(df.columns)
+                
+                mensajes_log.append(f"✅ Estructura base establecida desde '{file.name}'.")
+
+            if set(df.columns) != columnas_base:
+                faltantes = sorted(list(columnas_base - set(df.columns)))
+                adicionales = sorted(list(set(df.columns) - columnas_base))
+                msg = f"❌ '{file.name}' RECHAZADO. Columnas no coinciden. "
+                if faltantes: msg += f"Faltan: {faltantes}. "
+                if adicionales: msg += f"Sobran: {adicionales}."
+                mensajes_log.append(msg); continue
+
+            df = df[orden_columnas_base]
+            for col in df.select_dtypes(include=['object']).columns:
+                df[col] = df[col].astype(str).apply(limpiar_caracteres_ilegales)
+            
+            df['archivo_origen'] = file.name
+            dataframes.append(df)
+            log_msg = f"✅ '{file.name}' procesado."
+            if filas_eliminadas > 0:
+                log_msg += f" Se eliminaron {filas_eliminadas} filas en blanco."
+            mensajes_log.append(log_msg)
+
+        except Exception as e:
+            mensajes_log.append(f"💥 Error CRÍTICO al procesar '{file.name}': {e}")
+
+    if not dataframes:
+        return None, mensajes_log
+
+    df_consolidado = pd.concat(dataframes, ignore_index=True)
+
+    for col in df_consolidado.select_dtypes(include=['object']).columns:
+        if len(df_consolidado) > 0 and df_consolidado[col].nunique() / len(df_consolidado[col].dropna()) < 0.5:
+            df_consolidado[col] = df_consolidado[col].astype('category')
+    for col in df_consolidado.select_dtypes(include=['float']).columns:
+        if (df_consolidado[col].dropna() % 1 == 0).all():
+            df_consolidado[col] = df_consolidado[col].astype('Int64')
+
+    return df_consolidado, mensajes_log
+
+# --- Interfaz de Usuario (UI) ---
+st.title("📄 Consolidador de Archivos")
+st.markdown("Suba múltiples archivos (`xlsx`, `xls`, `csv`, `txt`). La aplicación los unificará, detectando automáticamente la codificación, eliminando filas en blanco y normalizando los datos.")
+
+archivos_cargados = st.file_uploader(
+    "📤 Seleccione sus archivos aquí",
+    type=['xlsx', 'xls', 'csv', 'txt'],
+    accept_multiple_files=True
+)
+
+if archivos_cargados:
+    with st.spinner("Realizando limpieza profunda y consolidación..."):
+        df_final, lista_logs = procesar_archivos_cargados(archivos_cargados)
+
+    st.subheader("📊 Resultados de la Consolidación")
+
+    if lista_logs:
+        with st.expander("Registro de Procesamiento", expanded=True):
+            for log in lista_logs:
+                if "❌" in log or "💥" in log or "RECHAZADO" in log: st.error(log)
+                elif "⚠️" in log: st.warning(log)
+                else: st.info(log)
+
+    if df_final is not None and not df_final.empty:
+        archivos_ok = df_final['archivo_origen'].nunique()
+        st.success(f"✅ ¡Consolidación exitosa! Se unieron {archivos_ok} archivos, resultando en {df_final.shape[0]} filas y {df_final.shape[1]} columnas.")
+        
+        st.dataframe(df_final.astype(object).fillna(''))
+        
+        try:
+            excel_bytes = convertir_a_excel(df_final)
+            st.download_button(
+                label="📥 Descargar Excel Consolidado",
+                data=excel_bytes,
+                file_name="consolidado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"💥 Error al generar el archivo Excel: {e}")
     else:
-        st.info("A la espera de archivos para iniciar el proceso de consolidación.")
-
-if __name__ == "__main__":
-    main()
+        st.error("❌ No se pudo consolidar ningún archivo. Revise los mensajes en el registro.")
+else:
+    st.info("Esperando a que suba los archivos para comenzar el proceso...")
