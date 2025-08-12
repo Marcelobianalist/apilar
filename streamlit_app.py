@@ -30,18 +30,22 @@ def normalizar_nombre_columna(col):
 
 def optimizar_tipos(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.select_dtypes(include=['float']).columns:
-        if (df[col] % 1 == 0).all():
-            df[col] = df[col].astype('Int32')
-
+        # Solo convertir si todos los valores no nulos son enteros
+        if (df[col].dropna() % 1 == 0).all():
+            try:
+                df[col] = df[col].astype('Int32')
+            except:
+                pass
     for col in df.select_dtypes(include=['object']).columns:
         if df[col].nunique() / max(len(df[col]), 1) < 0.5:
-            df[col] = df[col].astype('category')
-
+            try:
+                df[col] = df[col].astype('category')
+            except:
+                pass
     return df
 
 def leer_archivo(file) -> Optional[pd.DataFrame]:
     nombre = file.name.lower()
-
     if nombre.endswith(('.csv', '.txt', '.tsv')):
         for encoding in ENCODINGS:
             try:
@@ -51,14 +55,12 @@ def leer_archivo(file) -> Optional[pd.DataFrame]:
             except Exception:
                 continue
         return None
-
     elif nombre.endswith(('.xlsx', '.xls')):
         try:
             file.seek(0)
             return pd.read_excel(file, engine='openpyxl' if nombre.endswith('.xlsx') else 'xlrd')
         except Exception:
             return None
-
     return None
 
 def procesar_archivos(files: List) -> Tuple[Optional[pd.DataFrame], List[str]]:
@@ -66,19 +68,16 @@ def procesar_archivos(files: List) -> Tuple[Optional[pd.DataFrame], List[str]]:
     logs = []
     columnas_base = None
     orden_columnas = None
-
     for file in files:
         try:
             df = leer_archivo(file)
             if df is None or df.empty:
                 logs.append(f"⚠️ '{file.name}' vacío o ilegible.")
                 continue
-
             df.dropna(how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
             df.columns = [normalizar_nombre_columna(c) for c in df.columns]
             df = df.loc[:, ~df.columns.str.contains('^unnamed')]
-
             if columnas_base is None:
                 columnas_base = set(df.columns)
                 orden_columnas = list(df.columns)
@@ -89,19 +88,17 @@ def procesar_archivos(files: List) -> Tuple[Optional[pd.DataFrame], List[str]]:
                     df[col] = pd.NA
                 # Eliminar columnas sobrantes
                 df = df[[c for c in orden_columnas if c in df.columns]]
-
             df = optimizar_tipos(df)
             df['archivo_origen'] = file.name
             dataframes.append(df[orden_columnas + ['archivo_origen']])
             logs.append(f"✅ '{file.name}' procesado correctamente.")
-
         except Exception as e:
             logs.append(f"💥 Error en '{file.name}': {e}")
-
-    if not dataframes:
+    # Filtrar dataframes vacíos o completamente NA para evitar warnings futuros
+    dataframes_filtrados = [df for df in dataframes if df is not None and not df.empty and not df.isnull().all().all()]
+    if not dataframes_filtrados:
         return None, logs
-
-    df_final = pd.concat(dataframes, ignore_index=True)
+    df_final = pd.concat(dataframes_filtrados, ignore_index=True)
     return df_final, logs
 
 def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
@@ -132,8 +129,8 @@ if archivos:
 
     if df is not None and not df.empty:
         st.success(f"✅ Consolidación completada: {df.shape[0]} filas, {df.shape[1]} columnas.")
-        st.dataframe(df.head(500).astype(object).fillna(''))
-
+        # Mostrar preview seguro para pyarrow convirtiendo todo a string y rellenando NA con ''
+        st.dataframe(df.head(500).astype(str).fillna(''))
         try:
             excel_bytes = crear_excel_en_memoria(df)
             st.download_button(
@@ -148,4 +145,3 @@ if archivos:
         st.error("❌ No se generó ningún consolidado válido.")
 else:
     st.info("Cargue archivos para comenzar.")
-
