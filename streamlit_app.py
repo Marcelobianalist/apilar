@@ -4,13 +4,14 @@ from io import BytesIO
 from typing import List, Optional, Tuple, Union
 import unicodedata
 import re
+import chardet # <-- IMPORTANTE: Nueva librería
 
 # --- Configuración de la página ---
 st.set_page_config(page_title="Consolidador Universal", page_icon="⚙️", layout="wide")
 
 # --- Constantes ---
-ENCODINGS = ['utf-8-sig', 'utf-8', 'latin1', 'windows-1252', 'iso-8859-1']
-# Lista de delimitadores comunes para probar si la detección automática falla.
+# Lista de respaldo si chardet falla
+FALLBACK_ENCODINGS = ['utf-8', 'latin1', 'windows-1252', 'iso-8859-1']
 COMMON_DELIMITERS = [',', ';', '\t', '|'] 
 ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
 CATEGORY_THRESHOLD = 0.5
@@ -18,11 +19,11 @@ DEFAULT_SHEET_NAME_INPUT = "0"
 
 
 # --- Funciones Auxiliares (sin cambios) ---
-def limpiar_caracteres_ilegales(valor: any) -> any: #... (código sin cambios)
+def limpiar_caracteres_ilegales(valor: any) -> any:
     if isinstance(valor, str): return ILLEGAL_CHARACTERS_RE.sub('', valor)
     return valor
 
-def normalizar_nombre_columna(col: any) -> str: #... (código sin cambios)
+def normalizar_nombre_columna(col: any) -> str:
     if not isinstance(col, str): col = str(col)
     s = limpiar_caracteres_ilegales(col).lower().strip()
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
@@ -32,7 +33,7 @@ def normalizar_nombre_columna(col: any) -> str: #... (código sin cambios)
     s = s.strip('_')
     return s if s else "columna_sin_nombre"
 
-def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame: #... (código sin cambios)
+def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame:
     df_optimizado = df.copy()
     for col in df_optimizado.select_dtypes(include=['float']).columns:
         df_optimizado[col] = pd.to_numeric(df_optimizado[col], downcast='integer')
@@ -43,19 +44,18 @@ def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame: #... (código sin
             df_optimizado[col] = df_optimizado[col].astype('category')
     return df_optimizado
 
-def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO: #... (código sin cambios)
+def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Consolidado')
     output.seek(0)
     return output
 
-# --- LÓGICA DE LECTURA UNIVERSAL (CON DETECCIÓN DE SEPARADOR) ---
+# --- LÓGICA DE LECTURA CON DETECCIÓN DE ENCODING Y SEPARADOR ---
 def leer_archivo(file, sheet_name: Union[str, int, None]) -> Optional[pd.DataFrame]:
     """
-    Lee un archivo subido de forma inteligente.
-    - Para Excel: Usa 'sheet_name'.
-    - Para Texto (.txt, .csv, .tsv): Auto-detecta la codificación Y el separador.
+    Lee un archivo subido de forma robusta, detectando automáticamente la codificación
+    y el separador para archivos de texto.
     """
     nombre_archivo = file.name.lower()
     
@@ -66,48 +66,55 @@ def leer_archivo(file, sheet_name: Union[str, int, None]) -> Optional[pd.DataFra
             engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
             return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
             
-        # --- Lógica AVANZADA para archivos de Texto Plano ---
+        # --- Lógica DEFINITIVA para archivos de Texto Plano ---
         elif nombre_archivo.endswith(('.csv', '.txt', '.tsv')):
-            for encoding in ENCODINGS:
+            file.seek(0)
+            # 1. Leer los bytes para detectar la codificación
+            raw_data = file.read()
+            if not raw_data:
+                return pd.DataFrame() # Archivo vacío
+
+            result = chardet.detect(raw_data)
+            encoding_detectado = result['encoding']
+            
+            # Crear una lista de encodings a probar, con el detectado como prioridad
+            encodings_to_try = [encoding_detectado] + FALLBACK_ENCODINGS
+            # Eliminar duplicados manteniendo el orden
+            encodings_to_try = list(dict.fromkeys(filter(None, encodings_to_try)))
+
+            for encoding in encodings_to_try:
                 try:
                     file.seek(0)
-                    # 1. Intentar que Pandas auto-detecte el separador ('sniffer')
-                    #    Usamos engine='python' que es más lento pero más potente para detectar.
-                    df = pd.read_csv(file, sep=None, engine='python', encoding=encoding, low_memory=False)
+                    # Intentar leer con auto-detección de separador
+                    df = pd.read_csv(file, sep=None, engine='python', encoding=encoding, on_bad_lines='skip')
                     
-                    # 2. Si el resultado tiene 1 sola columna, el sniffer pudo fallar.
-                    #    Probamos manualmente con delimitadores comunes.
+                    # Si solo tiene una columna, probar delimitadores comunes
                     if df.shape[1] == 1:
                         file.seek(0)
-                        # Leemos la primera línea para ver si contiene algún delimitador común
                         first_line = file.readline().decode(encoding)
-                        file.seek(0) # Rebobinar de nuevo para la lectura completa
-
+                        file.seek(0)
                         for sep in COMMON_DELIMITERS:
                             if sep in first_line:
                                 try:
-                                    df_manual = pd.read_csv(file, sep=sep, encoding=encoding, low_memory=False)
-                                    # Si este intento genera más de 1 columna, es el correcto.
+                                    df_manual = pd.read_csv(file, sep=sep, encoding=encoding, on_bad_lines='skip')
                                     if df_manual.shape[1] > 1:
                                         return df_manual
                                 except pd.errors.ParserError:
-                                    # Este separador causó un error, probamos el siguiente
                                     file.seek(0)
                                     continue
-                    return df # Devolvemos el resultado (incluso si es de 1 columna)
+                    return df # Si todo funciona, devolver el DataFrame
 
                 except (UnicodeDecodeError, pd.errors.ParserError):
-                    # Este encoding falló, el bucle probará el siguiente
-                    continue
-            
-            # Si después de probar todos los encodings, nada funcionó
+                    continue # Probar el siguiente encoding de la lista
+
+            # Si nada funcionó, es un caso muy raro.
             return None
             
     except Exception as e:
         st.error(f"Error crítico al leer '{file.name}': {e}")
         return None
 
-    return None # Si la extensión no es soportada
+    return None
 
 # --- El resto del código (procesar_archivos, main) NO NECESITA CAMBIOS ---
 
@@ -142,13 +149,15 @@ def procesar_archivos(files: List, sheet_name: Union[str, int, None]) -> Tuple[O
 
 def main():
     st.title("⚙️ Consolidador Universal de Archivos")
-    st.markdown("Sube tus archivos (`Excel`, `CSV`, `TXT`, `TSV`). El sistema auto-detectará el formato, separador y codificación para unirlos de forma inteligente.")
+    st.markdown("Sube tus archivos (`Excel`, `CSV`, `TXT`, `TSV`). El sistema auto-detectará el formato, **codificación** y **separador** para unirlos.")
+    st.info("Para que esta aplicación funcione, la librería `chardet` debe estar instalada (`pip install chardet`).")
     with st.expander("Opciones avanzadas"):
-        sheet_input = st.text_input("Nombre u hoja de Excel a leer (solo para .xlsx/.xls)", DEFAULT_SHEET_NAME_INPUT, help="Escribe el nombre de la hoja o el número (empezando en 0).")
+        sheet_input = st.text_input("Nombre u hoja de Excel (solo .xlsx/.xls)", DEFAULT_SHEET_NAME_INPUT, help="Escribe el nombre de la hoja o el número (empezando en 0).")
         try: sheet_name = int(sheet_input)
         except ValueError: sheet_name = sheet_input
     archivos = st.file_uploader("📤 Sube tus archivos aquí", type=['xlsx', 'xls', 'csv', 'txt', 'tsv'], accept_multiple_files=True)
     if archivos:
+        # El resto de la función main es idéntica
         with st.spinner("🔄 Procesando y consolidando archivos..."):
             df_consolidado, logs = procesar_archivos(archivos, sheet_name)
         st.subheader("📜 Registro de Procesamiento")
