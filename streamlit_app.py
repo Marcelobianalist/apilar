@@ -86,11 +86,11 @@ def procesar_archivos(files: List) -> Tuple[Optional[pd.DataFrame], List[str]]:
                 orden_columnas = list(df.columns)
                 logs.append(f"✅ Plantilla establecida desde '{file.name}'.")
             else:
-                if set(df.columns) != columnas_base:
-                    faltan = columnas_base - set(df.columns)
-                    sobran = set(df.columns) - columnas_base
-                    logs.append(f"❌ '{file.name}' rechazado. Faltan: {faltan or 'ninguna'}, Sobran: {sobran or 'ninguna'}.")
-                    continue
+                # Agregar columnas faltantes
+                for col in columnas_base - set(df.columns):
+                    df[col] = pd.NA
+                # Eliminar columnas sobrantes
+                df = df[[c for c in orden_columnas if c in df.columns]]
 
             df = optimizar_tipos(df)
             df['archivo_origen'] = file.name
@@ -115,7 +115,7 @@ def guardar_excel_temporal(df: pd.DataFrame) -> str:
 
 # --- Interfaz ---
 st.title("📄 Consolidador Optimizado para Archivos Grandes")
-st.markdown("Procesa y unifica archivos grandes de manera eficiente, evitando que Streamlit se cierre por falta de memoria.")
+st.markdown("Procesa y unifica archivos grandes de manera eficiente, sin rechazar archivos por columnas faltantes o sobrantes.")
 
 archivos = st.file_uploader("📤 Suba sus archivos", type=['xlsx', 'xls', 'csv', 'txt', 'tsv'], accept_multiple_files=True)
 
@@ -125,7 +125,7 @@ if archivos:
 
     st.subheader("📜 Registro de Procesamiento")
     for log in logs:
-        if "❌" in log or "💥" in log:
+        if "💥" in log:
             st.error(log)
         elif "⚠️" in log:
             st.warning(log)
@@ -135,7 +135,7 @@ if archivos:
     if df is not None and not df.empty:
         st.success(f"✅ Consolidación completada: {df.shape[0]} filas, {df.shape[1]} columnas.")
 
-        # Vista previa de solo 500 filas
+        # Vista previa limitada
         st.dataframe(df.head(500).astype(object).fillna(''))
 
         try:
