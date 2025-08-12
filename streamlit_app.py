@@ -5,22 +5,25 @@ from typing import List, Optional, Tuple, Union
 import unicodedata
 import re
 
-# --- Configuración de la página de Streamlit ---
-st.set_page_config(page_title="Consolidador de Archivos", page_icon="📄", layout="wide")
+# --- Configuración de la página ---
+st.set_page_config(page_title="Consolidador Universal", page_icon="⚙️", layout="wide")
 
 # --- Constantes ---
 ENCODINGS = ['utf-8-sig', 'utf-8', 'latin1', 'windows-1252', 'iso-8859-1']
 ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
 CATEGORY_THRESHOLD = 0.5
+DEFAULT_SHEET_NAME_INPUT = "0"
 
 
-# --- Funciones Auxiliares (sin cambios) ---
+# --- Funciones Auxiliares ---
 
 def limpiar_caracteres_ilegales(valor: any) -> any:
+    """Elimina caracteres ilegales de un string."""
     if isinstance(valor, str): return ILLEGAL_CHARACTERS_RE.sub('', valor)
     return valor
 
 def normalizar_nombre_columna(col: any) -> str:
+    """Normaliza el nombre de una columna para que sea consistente y robusto."""
     if not isinstance(col, str): col = str(col)
     s = limpiar_caracteres_ilegales(col).lower().strip()
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
@@ -28,9 +31,10 @@ def normalizar_nombre_columna(col: any) -> str:
     s = re.sub(r"[ ./\-]+", "_", s)
     s = re.sub(r'__+', '_', s)
     s = s.strip('_')
-    return s
+    return s if s else "columna_sin_nombre"
 
 def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame:
+    """Optimiza los tipos de datos de un DataFrame para reducir el uso de memoria."""
     df_optimizado = df.copy()
     for col in df_optimizado.select_dtypes(include=['float']).columns:
         df_optimizado[col] = pd.to_numeric(df_optimizado[col], downcast='integer')
@@ -41,24 +45,39 @@ def optimizar_tipos_memoria(df: pd.DataFrame) -> pd.DataFrame:
             df_optimizado[col] = df_optimizado[col].astype('category')
     return df_optimizado
 
-def leer_archivo(file, sheet_name: Union[str, int, None] = 0) -> Optional[pd.DataFrame]:
+# --- LÓGICA DE LECTURA UNIVERSAL (LA CLAVE DE LA SOLUCIÓN) ---
+def leer_archivo(file, sheet_name: Union[str, int, None]) -> Optional[pd.DataFrame]:
+    """
+    Lee un archivo subido de forma inteligente, aplicando los parámetros correctos
+    según la extensión del archivo.
+    - 'sheet_name' solo se aplica a archivos Excel.
+    - 'encoding' y 'sep' se aplican a archivos de texto.
+    """
     nombre_archivo = file.name.lower()
     file.seek(0)
+    
     try:
+        # --- Lógica para archivos de Texto Plano ---
         if nombre_archivo.endswith(('.csv', '.txt', '.tsv')):
             sep = '\t' if nombre_archivo.endswith('.tsv') else ','
             for encoding in ENCODINGS:
                 try:
                     file.seek(0)
                     return pd.read_csv(file, sep=sep, encoding=encoding, low_memory=False)
-                except (UnicodeDecodeError, pd.errors.ParserError): continue
-            st.warning(f"No se pudo decodificar '{file.name}'.")
-            return None
+                except (UnicodeDecodeError, pd.errors.ParserError):
+                    continue
+            return None # Si ningún encoding funcionó
+        
+        # --- Lógica para archivos Excel ---
         elif nombre_archivo.endswith(('.xlsx', '.xls')):
             engine = 'openpyxl' if nombre_archivo.endswith('.xlsx') else 'xlrd'
             return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
+            
     except Exception as e:
         st.error(f"Error crítico al leer '{file.name}': {e}")
+        return None
+
+    # Si la extensión no es soportada
     return None
 
 def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
@@ -68,45 +87,64 @@ def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
     output.seek(0)
     return output
 
-# --- Función de Procesamiento (sin cambios) ---
-
+# --- Función de Procesamiento Universal ---
 def procesar_archivos(files: List, sheet_name: Union[str, int, None]) -> Tuple[Optional[pd.DataFrame], List[str]]:
     dataframes, logs = [], []
+    
+    # Comprobar si se ha usado una opción de hoja específica
+    sheet_option_used = str(sheet_name) != DEFAULT_SHEET_NAME_INPUT
+
     for file in files:
         logs.append(f"⏳ Procesando '{file.name}'...")
+
+        # Notificar al usuario si la opción de hoja se ignora para archivos no-Excel
+        is_excel = file.name.lower().endswith(('.xlsx', '.xls'))
+        if sheet_option_used and not is_excel:
+            logs.append(f"ℹ️  Opción de hoja '{sheet_name}' ignorada para el archivo de texto '{file.name}'.")
+
         df = leer_archivo(file, sheet_name)
+        
         if df is None:
-            logs.append(f"💥 Error: No se pudo leer el archivo '{file.name}'.")
+            logs.append(f"💥 Error: No se pudo leer o decodificar el archivo '{file.name}'.")
             continue
-        df.dropna(how='all', inplace=True) 
+        
+        df.dropna(how='all', inplace=True)
         if df.empty:
             logs.append(f"⚠️ Aviso: El archivo '{file.name}' está vacío o no contiene datos válidos.")
             continue
+        
         df.columns = [normalizar_nombre_columna(c) for c in df.columns]
         df = df.loc[:, ~df.columns.str.contains('^unnamed', na=False)]
         df['archivo_origen'] = file.name
         dataframes.append(df)
         logs.append(f"✅ Éxito: '{file.name}' añadido a la consolidación.")
-    if not dataframes: return None, logs
+
+    if not dataframes:
+        return None, logs
+    
     df_final = pd.concat(dataframes, ignore_index=True, sort=False)
+    
     cols = df_final.columns.tolist()
     if 'archivo_origen' in cols:
         cols.insert(0, cols.pop(cols.index('archivo_origen')))
         df_final = df_final[cols]
-    df_final = optimizar_tipos_memoria(df_final)
-    return df_final, logs
+    
+    return optimizar_tipos_memoria(df_final), logs
 
-# --- Interfaz Principal (CON LA SOLUCIÓN DEFINITIVA) ---
-
+# --- Interfaz Principal ---
 def main():
-    st.title("📄 Consolidador Inteligente de Archivos")
+    st.title("⚙️ Consolidador Universal de Archivos")
     st.markdown(
-        "Sube múltiples archivos (Excel, CSV, TXT, TSV) para unificarlos en uno solo. "
-        "El sistema **unirá todas las columnas de todos los archivos** de forma automática."
+        "Sube múltiples archivos (`Excel`, `CSV`, `TXT`, `TSV`). El sistema los procesará "
+        "de forma inteligente y unirá todas sus columnas en un único resultado."
     )
     
     with st.expander("Opciones avanzadas"):
-        sheet_input = st.text_input("Nombre u hoja de Excel a leer", "0", help="Escribe el nombre de la hoja o el número (empezando en 0).")
+        sheet_input = st.text_input(
+            "Nombre u hoja de Excel a leer (solo para .xlsx/.xls)", 
+            DEFAULT_SHEET_NAME_INPUT,
+            help="Escribe el nombre de la hoja (ej. 'Ventas') o el número (empezando en 0)."
+        )
         try: sheet_name = int(sheet_input)
         except ValueError: sheet_name = sheet_input
             
@@ -134,48 +172,22 @@ def main():
             st.success(f"Se han consolidado **{df_consolidado.shape[0]:,}** filas y **{df_consolidado.shape[1]}** columnas.")
             
             st.subheader("📊 Previsualización (primeros 500 registros)")
-            df_display = df_consolidado.head(500).astype(str)
-            st.dataframe(df_display, use_container_width=True)
+            st.dataframe(df_consolidado.head(500).astype(str), use_container_width=True)
 
             st.subheader("⬇️ Descarga")
-            # --- INICIO DE LA SOLUCIÓN DEFINITIVA ---
             try:
-                # 1. INTENTAR GENERAR EL ARCHIVO EXCEL
-                with st.spinner("⏳ Preparando archivo Excel (puede tardar o fallar con archivos muy grandes)..."):
+                with st.spinner("⏳ Preparando archivo Excel (puede tardar con archivos muy grandes)..."):
                     excel_bytes = crear_excel_en_memoria(df_consolidado)
-                
-                st.success("✅ ¡Archivo Excel generado con éxito!")
-                st.download_button(
-                    label="📥 Descargar Excel Consolidado (.xlsx)",
-                    data=excel_bytes,
-                    file_name="consolidado.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                st.success("✅ ¡Archivo Excel listo!")
+                st.download_button("📥 Descargar Excel Consolidado (.xlsx)", excel_bytes, "consolidado.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
             except Exception as e:
-                # 2. SI FALLA, OFRECER EL PLAN B: CSV
-                st.error(
-                    "💥 **Error al generar el archivo Excel.** "
-                    f"Esto suele ocurrir por falta de memoria al procesar un archivo muy grande. (Error: {e})"
-                )
-                st.info(
-                    "**Como alternativa, puedes descargar todos tus datos en formato CSV, que es mucho más eficiente en memoria.**"
-                )
-                
+                st.error(f"💥 **Error al generar Excel:** {e}")
+                st.info("**Plan B:** Descargando como CSV, un formato más rápido y fiable para archivos grandes.")
                 with st.spinner("⏳ Generando archivo CSV de respaldo..."):
-                    # Usar utf-8-sig para compatibilidad con caracteres especiales en Excel
                     csv_bytes = df_consolidado.to_csv(index=False).encode('utf-8-sig')
-
-                st.download_button(
-                    label="📥 Descargar datos en formato CSV (.csv)",
-                    data=csv_bytes,
-                    file_name="consolidado.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            # --- FIN DE LA SOLUCIÓN DEFINITIVA ---
+                st.download_button("📥 Descargar Datos en CSV (.csv)", csv_bytes, "consolidado.csv", "text/csv", use_container_width=True)
         else:
-            st.error("❌ No se pudo generar un archivo consolidado. Revisa los registros de errores de arriba.")
+            st.error("❌ No se pudo generar un archivo consolidado. Revisa los registros.")
     else:
         st.info("A la espera de archivos para iniciar el proceso de consolidación.")
 
