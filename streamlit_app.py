@@ -4,8 +4,6 @@ from io import BytesIO
 from typing import List, Optional, Tuple
 import unicodedata
 import re
-import tempfile
-import os
 
 # --- Configuración de la página ---
 st.set_page_config(page_title="Consolidador Archivos Grandes", page_icon="📄", layout="wide")
@@ -106,12 +104,12 @@ def procesar_archivos(files: List) -> Tuple[Optional[pd.DataFrame], List[str]]:
     df_final = pd.concat(dataframes, ignore_index=True)
     return df_final, logs
 
-def guardar_excel_temporal(df: pd.DataFrame) -> str:
-    temp_dir = tempfile.gettempdir()
-    temp_path = os.path.join(temp_dir, "consolidado.xlsx")
-    with pd.ExcelWriter(temp_path, engine='openpyxl') as writer:
+def crear_excel_en_memoria(df: pd.DataFrame) -> BytesIO:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Consolidado')
-    return temp_path
+    output.seek(0)
+    return output
 
 # --- Interfaz ---
 st.title("📄 Consolidador Optimizado para Archivos Grandes")
@@ -134,19 +132,16 @@ if archivos:
 
     if df is not None and not df.empty:
         st.success(f"✅ Consolidación completada: {df.shape[0]} filas, {df.shape[1]} columnas.")
-
-        # Vista previa limitada
         st.dataframe(df.head(500).astype(object).fillna(''))
 
         try:
-            ruta_excel = guardar_excel_temporal(df)
-            with open(ruta_excel, "rb") as f:
-                st.download_button(
-                    label="📥 Descargar Excel Consolidado",
-                    data=f,
-                    file_name="consolidado.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+            excel_bytes = crear_excel_en_memoria(df)
+            st.download_button(
+                label="📥 Descargar Excel Consolidado",
+                data=excel_bytes,
+                file_name="consolidado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         except Exception as e:
             st.error(f"💥 Error exportando a Excel: {e}")
     else:
